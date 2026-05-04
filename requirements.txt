@@ -1,9 +1,16 @@
-streamlit
-opencv-python-headless
-mediapipe-model-maker
-mediapipe
-numpy
-pandas
-pillow
-supabase
-altair
+# 基礎框架
+streamlit==1.57.0
+opencv-python-headless==4.10.0.84
+
+# AI 與影像處理核心 (移除 mediapipe-model-maker，鎖定 numpy 與 mediapipe)
+mediapipe==0.10.14
+numpy>=1.26.0,<2.0.0
+pillow==10.3.0
+
+# 數據與後端
+pandas==2.2.2
+supabase==2.5.1
+altair==5.3.0
+
+# 工具
+urllib3<2.0.0
