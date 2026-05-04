@@ -42,13 +42,11 @@ def apply_adaptive_chromatic_adaptation(img_bgr, face_roi_mean=None):
     b, g, r = cv2.split(img_float)
     
     if face_roi_mean is not None:
-        # 以臉部平均色作為中性參考點 (Local Chromatic Adaptation)
         target_val = (face_roi_mean[0] + face_roi_mean[1] + face_roi_mean[2]) / 3.0
         b_gain = target_val / (face_roi_mean[0] + 1e-6)
         g_gain = target_val / (face_roi_mean[1] + 1e-6)
         r_gain = target_val / (face_roi_mean[2] + 1e-6)
     else:
-        # 降級方案：使用全域平均值 (類灰世界)
         mean_b, mean_g, mean_r = np.mean(b), np.mean(g), np.mean(r)
         mean_gray = (mean_b + mean_g + mean_r) / 3.0
         b_gain, g_gain, r_gain = mean_gray/mean_b, mean_gray/mean_g, mean_gray/mean_r
@@ -77,7 +75,7 @@ def apply_msr_algorithm(img):
 def analyze_dark_circles(image_file):
     """
     黑眼圈分析主程式：
-    【專家核心修正】特徵取樣嚴格使用白平衡影像，MSR 僅做前端視覺輔助與特徵點擷取。
+    【專家核心修正】特徵取樣嚴格使用白平衡影像，並導入中位數(Median)統計法抵抗雜訊。
     """
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
     orig_image = cv2.imdecode(file_bytes, 1)
@@ -86,28 +84,21 @@ def analyze_dark_circles(image_file):
         
     gray_image = cv2.cvtColor(orig_image, cv2.COLOR_BGR2GRAY)
     
-    # 1. 啟動光線驗證攔截機制
     is_good_light, light_msg = validate_lighting_conditions(gray_image)
     if not is_good_light:
         return None, f"檢測失敗：{light_msg}。請移至光源明亮且均勻的地方再試一次。"
     
-    # 2. 影像前處理
     wb_img = apply_adaptive_chromatic_adaptation(orig_image)
     enhanced_img = apply_msr_algorithm(wb_img)
-    # MediaPipe 需要辨識度高的影像，所以用 enhanced_img
     image_rgb = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB) 
     
-    # 3. 進入真實 32-bit CIELAB 空間進行科學計算
-    # 致命 Bug 修正：特徵取樣必須使用未被 MSR 摧毀色度比例的 wb_img
     img_float32 = wb_img.astype(np.float32) / 255.0
     image_lab_real = cv2.cvtColor(img_float32, cv2.COLOR_BGR2Lab)
     
     h, w, _ = enhanced_img.shape
-    # 畫布保持使用原始圖片或強化圖片
     annotated_img = cv2.cvtColor(orig_image, cv2.COLOR_BGR2RGB).copy()
     
     mp_face_mesh = mp.solutions.face_mesh
-    # 鎖定特徵區域 (ROI)
     LEFT_EYE_ROI = [228, 229, 230, 231, 232, 233, 123]
     CHEEK_ROI = [205, 206, 207, 187, 147]
 
@@ -120,49 +111,50 @@ def analyze_dark_circles(image_file):
         left_eye_pts = [(int(lms.landmark[i].x * w), int(lms.landmark[i].y * h)) for i in LEFT_EYE_ROI]
         
         def get_roi_stats(idx_list, color, label):
+            """
+            【專家修正】放棄 cv2.mean，改用 np.median 過濾睫毛與反光極端值
+            """
             pts = np.array([[int(lms.landmark[i].x * w), int(lms.landmark[i].y * h)] for i in idx_list])
             mask = np.zeros((h, w), dtype=np.uint8)
             cv2.fillPoly(mask, [pts], 255)
             
-            # 從真實比例的 Lab 空間提取色彩
-            mean_L = cv2.mean(image_lab_real[:,:,0], mask=mask)[0]
-            mean_a = cv2.mean(image_lab_real[:,:,1], mask=mask)[0]
-            mean_b = cv2.mean(image_lab_real[:,:,2], mask=mask)[0]
+            # 取出 Mask 內的有效像素
+            L_vals = image_lab_real[:,:,0][mask == 255]
+            a_vals = image_lab_real[:,:,1][mask == 255]
+            b_vals = image_lab_real[:,:,2][mask == 255]
+            
+            # 使用中位數避免雜訊干擾
+            median_L = np.median(L_vals) if len(L_vals) > 0 else 0
+            median_a = np.median(a_vals) if len(a_vals) > 0 else 0
+            median_b = np.median(b_vals) if len(b_vals) > 0 else 0
             
             cv2.polylines(annotated_img, [pts], True, color, 2)
             top_point = tuple(pts[pts[:, 1].argmin()])
             cv2.putText(annotated_img, label, (top_point[0], top_point[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            return mean_L, mean_a, mean_b
+            return median_L, median_a, median_b
 
-        # 取得眼下與臉頰的色彩數據
         eye_L, eye_a, eye_b = get_roi_stats(LEFT_EYE_ROI, (255, 0, 0), "Z2(Eye)")
         cheek_L, cheek_a, cheek_b = get_roi_stats(CHEEK_ROI, (0, 255, 0), "ZC(Cheek)")
         
-        # ==========================================
-        # 🔥 核心升級：導入連續閾值映射 (防禦斷層落差)
-        # ==========================================
+        # 計算特徵距離
         delta_E = math.sqrt((cheek_L - eye_L)**2 + (cheek_a - eye_a)**2 + (cheek_b - eye_b)**2)
         fatigue_index = eye_L / (cheek_L + 1e-6)
         
-        # 計算皮膚科專用 ITA 角度 (Individual Typology Angle)
         safe_cheek_b = max(cheek_b, 1e-5) if cheek_b >= 0 else min(cheek_b, -1e-5)
         ita = math.atan((cheek_L - 50.0) / safe_cheek_b) * (180.0 / math.pi)
         
-        # 使用線性插值計算動態閾值：ITA 在 [10.0, 41.0] 區間平滑映射 Delta E [2.0, 3.5]
         dynamic_delta_E_thresh = np.interp(ita, [10.0, 41.0], [2.0, 3.5])
         dynamic_L_drop_thresh = np.interp(ita, [10.0, 41.0], [3.0, 5.0])
         
         has_dark_circles = False
         detected_type = "normal"
 
-        # 綜合判定邏輯
         if (delta_E > dynamic_delta_E_thresh) or ((cheek_L - eye_L) > dynamic_L_drop_thresh) or (fatigue_index < 0.85):
             has_dark_circles = True
-            # 【專家修正】基於色彩表型 (Phenotype) 之傾向分析，而非診斷
             if eye_b < (cheek_b - 0.8) or eye_a > (cheek_a + 0.8):
-                detected_type = "vascular" # 傾向藍紫型/血管循環
+                detected_type = "vascular" 
             else:
-                detected_type = "pigmented" # 傾向褐色型/色素沉澱
+                detected_type = "pigmented" 
 
         return {
             "orig": cv2.cvtColor(orig_image, cv2.COLOR_BGR2RGB),
@@ -172,11 +164,11 @@ def analyze_dark_circles(image_file):
             "has_dark_circles": has_dark_circles,
             "detected_type": detected_type,
             "metrics": {
-                "eye_L": round(eye_L, 1), 
-                "cheek_L": round(cheek_L, 1),
-                "fatigue_index": round(fatigue_index, 3), 
-                "delta_E": round(delta_E, 2),
-                "ita": round(ita, 1),
-                "dynamic_thresh": round(dynamic_delta_E_thresh, 2)
+                "eye_L": round(float(eye_L), 1), 
+                "cheek_L": round(float(cheek_L), 1),
+                "fatigue_index": round(float(fatigue_index), 3), 
+                "delta_E": round(float(delta_E), 2),
+                "ita": round(float(ita), 1),
+                "dynamic_thresh": round(float(dynamic_delta_E_thresh), 2)
             }
         }, None
