@@ -1,5 +1,2 @@
-# Debian (apt) packages required at runtime.
-# OpenCV-headless 還是會在 import 時尋找 libGL 與 glib，
-# 在某些 Cloud 鏡像上預裝不完整，因此明列：
 libgl1
 libglib2.0-0
