@@ -1,9 +1,21 @@
-streamlit==1.57.0
-opencv-python-headless==4.10.0.84
-mediapipe==0.10.35
-numpy==1.26.4
-pillow==10.3.0
+# ============================================================
+#  Genki Beibei v2.0 — Dependency Matrix
+#  Target: CPython 3.11.9 (Streamlit Community Cloud)
+#  All packages below ship pre-built manylinux2014_x86_64 wheels
+#  for cp311, so the build phase contains ZERO C/C++ compilation.
+# ============================================================
+
+# --- Web framework -------------------------------------------
+streamlit==1.41.1            # Stable LTS-grade build; works with py 3.9-3.13
+# --- Vision stack --------------------------------------------
+opencv-python-headless==4.9.0.80   # Headless build avoids libGL on Cloud
+mediapipe==0.10.14           # Last release with widest cp311 wheel coverage
+numpy==1.26.4                # mediapipe 0.10.14 pinned upper bound
+pillow==10.3.0               # Has cp311 wheel; avoid 10.4 (arm64 issues)
+# --- Data layer ----------------------------------------------
 pandas==2.2.2
-supabase==2.5.1
 altair==5.3.0
-protobuf>=3.20,<5
+# --- Cloud storage -------------------------------------------
+supabase==2.5.1
+# --- Implicit but worth pinning ------------------------------
+protobuf>=3.20,<5            # mediapipe transitive; without bound pip resolves >=5 and breaks
