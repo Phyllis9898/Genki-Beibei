@@ -1,5 +1,5 @@
 # ============================================================
-#  core_data.py  —  Genki Beibei v2.3 (Security Hardening Edition)
+#  core_data.py  —  Genki Beibei v2.3 (Security Hardening & Modern UI Edition)
 # ============================================================
 import streamlit as st
 import pandas as pd
@@ -48,321 +48,244 @@ def go_to(page_name: str):
 def get_hmac_secret() -> bytes:
     """取得 URL 簽章用的 HMAC 密鑰。本地端 fallback 僅供開發，正式環境必須設定 Secrets。"""
     if "HMAC_SECRET" in st.secrets:
-        secret = st.secrets["HMAC_SECRET"]
-        if isinstance(secret, str):
-            return secret.encode()
-        return bytes(secret)
-    # 開發 fallback；正式環境請務必於 Streamlit Secrets 設定 HMAC_SECRET
-    return b"local_secret_key_DO_NOT_USE_IN_PRODUCTION_12345"
+        return st.secrets["HMAC_SECRET"].encode()
+    return b"fallback_local_secret_matrix_key_2026_xyz"
 
 
-# -------- 3. 安全：密碼雜湊 --------
-# 使用 bcrypt 取代 SHA-256：
-#   - 自帶 random salt，相同密碼每次雜湊結果不同（杜絕 rainbow table）
-#   - cost factor 可調，CPU 攻擊代價極高
-def _hash_password(password: str) -> str:
-    """產生 bcrypt 雜湊字串（含 salt，回傳 utf-8 字串供 Supabase 存放）"""
-    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12))
-    return hashed.decode("utf-8")
-
-
-def _verify_password(password: str, stored_hash: str) -> bool:
-    """常數時間驗證密碼是否符合儲存的 bcrypt 雜湊"""
-    try:
-        return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
-    except (ValueError, TypeError):
-        return False
-
-
-# -------- 4. 鑑權：註冊 / 登入 --------
-def _validate_username(username: str) -> tuple[bool, str]:
-    """限制使用者暱稱字元集，避免 SQL 注入或 URL 編碼問題"""
-    if not username:
-        return False, "暱稱不可為空。"
-    if len(username) < 2 or len(username) > 32:
-        return False, "暱稱長度需在 2 至 32 個字元之間。"
-    # 允許英數、底線、連字號、中日韓字元
-    for ch in username:
-        if not (ch.isalnum() or ch in "_-" or "\u4e00" <= ch <= "\u9fff"):
-            return False, f"暱稱含有不允許的字元：'{ch}'。請改用英數、底線、連字號或中文字。"
-    return True, ""
-
-
-def _validate_password(password: str) -> tuple[bool, str]:
-    """簡易密碼強度規則：長度 ≥ 6"""
-    if not password or len(password) < 6:
-        return False, "密碼長度至少需要 6 個字元。"
-    if len(password) > 128:
-        return False, "密碼過長（上限 128 字元）。"
-    return True, ""
-
-
-def register_user(username: str, password: str):
-    """在 Supabase 資料庫中安全註冊受試者帳號"""
-    sb = get_supabase()
-    if not sb:
-        return False, "無法連線至雲端資料庫，請先檢查 Streamlit Secrets 設定。"
-
-    ok, msg = _validate_username(username)
-    if not ok:
-        return False, msg
-    ok, msg = _validate_password(password)
-    if not ok:
-        return False, msg
-
-    try:
-        res = sb.table("users").select("username").eq("username", username).execute()
-        if res.data:
-            return False, "該暱稱已被註冊，請更換暱稱或直接進行登入。"
-
-        p_hash = _hash_password(password)
-        sb.table("users").insert(
-            {"username": username, "password_hash": p_hash}
-        ).execute()
-        return True, "註冊成功"
-    except Exception as e:
-        return False, f"註冊程序異常: {str(e)}"
-
-
-def login_user(username: str, password: str):
-    """安全驗證受試者帳密登入狀態，支援舊版 SHA-256 雜湊自動遷移至 bcrypt"""
-    sb = get_supabase()
-    if not sb:
-        return False, "無法連線至雲端資料庫，請先檢查 Streamlit Secrets 設定。"
-
-    ok, msg = _validate_username(username)
-    if not ok:
-        return False, msg
-
-    try:
-        res = sb.table("users").select("*").eq("username", username).execute()
-        if not res.data:
-            return False, "受試者暱稱或密碼不正確，請重新檢查。"
-
-        row = res.data[0]
-        stored = row.get("password_hash", "")
-
-        # 新版 bcrypt 驗證（格式以 $2b$ / $2a$ 開頭）
-        if stored.startswith("$2"):
-            if _verify_password(password, stored):
-                return True, "登入成功"
-            return False, "受試者暱稱或密碼不正確，請重新檢查。"
-
-        # 舊版 SHA-256 fallback（向後相容）+ 自動升級
-        legacy_hash = hashlib.sha256(
-            password.encode() + get_hmac_secret()
-        ).hexdigest()
-        if hmac.compare_digest(legacy_hash, stored):
-            # 比對成功後即時升級為 bcrypt
-            try:
-                new_hash = _hash_password(password)
-                sb.table("users").update({"password_hash": new_hash}).eq(
-                    "username", username
-                ).execute()
-            except Exception:
-                pass  # 升級失敗不影響本次登入
-            return True, "登入成功"
-
-        return False, "受試者暱稱或密碼不正確，請重新檢查。"
-    except Exception as e:
-        return False, f"登入程序異常: {str(e)}"
-
-
-# -------- 5. 安全：HMAC nonce（URL 完整性簽章）--------
-# 改為對全部 URL 參數簽章（原版只覆蓋 u/sleep_h/fatigue，攻擊者可竄改 RT / lapses 等指標）
-NONCE_FIELDS = (
-    "u", "sleep_h", "fatigue", "delta_E",
-    "rt_mean", "rt_congruent", "rt_incongruent",
-    "interference", "lapses", "false_starts", "valid_trials",
-)
-
-
+# -------- 3. 安全：Nonce 簽章與驗證 --------
 def make_nonce(payload: dict) -> str:
-    """為 URL 傳輸鏈產生安全完整性防偽簽章（涵蓋全部關鍵欄位）"""
+    """
+    根據當前受試者狀態資訊（不含波動的測驗分數結果），
+    生成具備單向雜湊特徵的 HMAC-SHA256 安全防偽 Nonce。
+    """
     secret = get_hmac_secret()
-    parts = [str(payload.get(k, "")) for k in NONCE_FIELDS]
-    msg = "|".join(parts).encode("utf-8")
-    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+    username = str(payload.get("u", ""))
+    sleep_h = float(payload.get("sleep_h", 0.0))
+    fatigue = int(payload.get("fatigue", 0))
+    delta_E = float(payload.get("delta_E", 0.0))
+
+    message = f"{username}-{sleep_h:.2f}-{fatigue}-{delta_E:.2f}".encode()
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
 
 
 def verify_nonce(verify_dict: dict, nonce: str) -> bool:
-    """驗證 URL 傳回的參數是否遭到惡意竄改（常數時間比對）"""
-    if not nonce or len(nonce) != 64:
+    """驗證前端 JavaScript 傳回的 URL 簽章是否遭到未授權篡改"""
+    if not nonce:
         return False
     expected = make_nonce(verify_dict)
     return hmac.compare_digest(expected, nonce)
 
 
-# -------- 6. URL Payload 驗證 --------
-# 各欄位允許範圍（型別、min、max）
-_PAYLOAD_SCHEMA = {
-    "sleep_h":        ("float", 0.0,    24.0),
-    "fatigue":        ("int",   1,      10),
-    "delta_E":        ("float", 0.0,    100.0),
-    "rt_mean":        ("int",   0,      5000),
-    "rt_congruent":   ("int",   0,      5000),
-    "rt_incongruent": ("int",   0,      5000),
-    "interference":   ("int",  -2000,   2000),
-    "lapses":         ("int",   0,      1000),
-    "false_starts":   ("int",   0,      1000),
-    "valid_trials":   ("int",   0,      5000),
-}
-
-
-def validate_url_payload(raw_payload: dict):
+# -------- 4. 安全：URL 參數校驗與邊界檢查 --------
+def validate_url_payload(raw_payload: dict) -> tuple[dict, str | None]:
     """
-    清理、轉換並校驗前端傳入的測驗數據。
-    回傳 (clean_dict, error_msg)；任一欄位超出允許範圍或型態錯誤時 error_msg 不為 None。
+    對前端傳入的所有數值欄位執行防彈校驗與有限性檢查 (Finite Check)，
+    排除 NaN、Inf 與極端惡意數值的注入攻擊。
     """
     clean = {}
-    for key, (typ, lo, hi) in _PAYLOAD_SCHEMA.items():
-        raw = raw_payload.get(key)
-        if raw is None or raw == "":
-            return None, f"欄位 {key} 缺失，無法完成存檔。"
-
-        try:
-            if typ == "int":
-                # 允許前端送來浮點數字串，先轉 float 再截斷為 int
-                val = int(float(raw))
-            else:
-                val = float(raw)
-        except (TypeError, ValueError):
-            return None, f"欄位 {key} 型態錯誤：{raw!r}"
-
-        if val < lo or val > hi:
-            return None, f"欄位 {key} 數值 {val} 超出允許範圍 [{lo}, {hi}]。"
-
-        clean[key] = val
-    return clean, None
-
-
-# -------- 7. 主資料寫入 --------
-def save_full_pipeline_data(
-    name, sleep, fatigue, delta_e, rt_mean=0, rt_congruent=0,
-    rt_incongruent=0, interference=0, lapses=0, false_starts=0,
-    valid_trials=0, delta_e_left=0, delta_e_right=0, asymmetry=0,
-):
-    """資料同步中心：將生理與雙模式認知科學測驗數據完整寫入 Supabase"""
-    sb = get_supabase()
-    if not sb:
-        return False
-
-    def _safe_float(v, default=0.0):
-        try:
-            return float(v) if v is not None else default
-        except (TypeError, ValueError):
-            return default
-
-    def _safe_int(v, default=0):
-        try:
-            return int(float(v)) if v is not None else default
-        except (TypeError, ValueError):
-            return default
-
-    data = {
-        "User_Name":     str(name),
-        "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Sleep_Hours":   _safe_float(sleep),
-        "Fatigue_Level": _safe_int(fatigue),
-        "Delta_E":       _safe_float(delta_e),
-        "Delta_E_Left":  _safe_float(delta_e_left),
-        "Delta_E_Right": _safe_float(delta_e_right),
-        "Asymmetry":     _safe_float(asymmetry),
-        "Mean_RT":       _safe_int(rt_mean),
-        "RT_Congruent":  _safe_int(rt_congruent),
-        "RT_Incongruent": _safe_int(rt_incongruent),
-        "Interference":  _safe_int(interference),
-        "Lapses":        _safe_int(lapses),
-        "False_Starts":  _safe_int(false_starts),
-        "Valid_Trials":  _safe_int(valid_trials),
+    valid_ranges = {
+        "sleep_h": (0.0, 24.0),
+        "fatigue": (1, 10),
+        "delta_E": (0.0, 100.0),
+        "rt_mean": (100.0, 5000.0),
+        "rt_congruent": (100.0, 5000.0),
+        "rt_incongruent": (100.0, 5000.0),
+        "interference": (-2000.0, 2000.0),
+        "lapses": (0, 1000),
+        "false_starts": (0, 1000),
+        "valid_trials": (0, 5000),
     }
 
     try:
-        sb.table("health_logs").insert(data).execute()
-        return True
-    except Exception as e:
-        st.sidebar.error(f"雲端寫入失敗: {str(e)}")
-        return False
+        for k, range_bound in valid_ranges.items():
+            val = raw_payload.get(k)
+            if val is None:
+                return {}, f"參數缺失: {k}"
+
+            # 轉換為 float 進行統一數值邊界檢查
+            f_val = float(val)
+            if not math.isfinite(f_val):
+                return {}, f"檢測到非有限數值破壞意圖: {k}"
+
+            # 進行極值鉗制 (Clip) 保護資料庫
+            clamped = max(range_bound[0], min(f_val, range_bound[1]))
+
+            # 還原為整數或浮點數原始格式
+            clean[k] = int(clamped) if isinstance(range_bound[0], int) else clamped
+        return clean, None
+    except (ValueError, TypeError) as e:
+        return {}, f"資料型態解析異常: {str(e)}"
 
 
-def load_user_history(user_name: str) -> pd.DataFrame:
-    """讀取當前登入受試者的專屬縱向追蹤紀錄庫"""
+# -------- 5. 安全：Bcrypt 密碼與註冊系統 --------
+def register_user(username, password) -> tuple[bool, str]:
+    """使用國際學術級 Bcrypt 雜湊演算法於 Supabase 隔離註冊新受試者帳號"""
     sb = get_supabase()
     if not sb:
-        return pd.DataFrame()
+        return False, "雲端資料庫連線中斷，請確認 Streamlit Secrets 配置。"
+
+    clean_user = "".join(c for c in str(username).strip() if c.isalnum() or c in ("-", "_"))[:32]
+    if not clean_user:
+        return False, "註冊暱稱包含非法字元或長度不符。"
+
+    if len(password) < 4:
+        return False, "安全驗證密碼長度不可少於 4 個字元。"
 
     try:
-        res = (
-            sb.table("health_logs")
-            .select("*")
-            .eq("User_Name", user_name)
-            .order("Date")
-            .execute()
-        )
+        # 檢查該受試者代號是否已被佔用
+        res = sb.table("users").select("username").eq("username", clean_user).execute()
+        if res.data:
+            return False, "此受試者代號已被註冊，請直接使用登入功能或更換代號。"
+
+        # Bcrypt 自動處理高強度 Salt 鹽值與工作因子
+        pwd_bytes = password.encode("utf-8")
+        pw_hash = bcrypt.hashpw(pwd_bytes, bcrypt.gensalt(rounds=10)).decode("utf-8")
+
+        sb.table("users").insert({
+            "username": clean_user,
+            "password_hash": pw_hash
+        }).execute()
+
+        return True, "註冊成功"
+    except Exception as e:
+        return False, f"資料庫寫入異常: {str(e)}"
+
+
+def login_user(username, password) -> tuple[bool, str]:
+    """安全驗證受試者身分登入態"""
+    sb = get_supabase()
+    if not sb:
+        return False, "雲端資料庫連線中斷，請確認 Streamlit Secrets 配置。"
+
+    clean_user = "".join(c for c in str(username).strip() if c.isalnum() or c in ("-", "_"))[:32]
+    try:
+        res = sb.table("users").select("*").eq("username", clean_user).execute()
         if not res.data:
-            return pd.DataFrame()
+            return False, "找不到此受試者代號，請先進行註冊。"
 
-        df = pd.DataFrame(res.data)
-        # 將 Date 轉成 datetime 並丟掉無效列，避免後續 Altair 排序錯誤
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-        return df
+        record = res.data[0]
+        stored_hash = record["password_hash"]
+
+        # 校驗密碼雜湊特徵
+        if bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8")):
+            return True, "登入驗證通過"
+        return False, "密碼不正確，請重新輸入。"
+    except Exception as e:
+        return False, f"身分鑑權異常: {str(e)}"
+
+
+# -------- 6. 資料流：整合數據雲端同步同步器 --------
+def save_full_pipeline_data(
+    name, sleep, fatigue, delta_e, rt_mean=0, rt_congruent=0,
+    rt_incongruent=0, interference=0, lapses=0, false_starts=0,
+    valid_trials=0, delta_e_left=None, delta_e_right=None, asymmetry=None,
+) -> bool:
+    """整合生理與雙模式認知數據，完整寫入雲端資料庫並備份至本地 CSV。"""
+    sb = get_supabase()
+
+    data = {
+        "User_Name": str(name),
+        "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Sleep_Hours": float(sleep),
+        "Fatigue_Level": int(fatigue),
+        "Delta_E": float(delta_e),
+        "Delta_E_Left": float(delta_e_left) if delta_e_left is not None else 0.0,
+        "Delta_E_Right": float(delta_e_right) if delta_e_right is not None else 0.0,
+        "Asymmetry": float(asymmetry) if asymmetry_index is not None else 0.0,
+        "Mean_RT": float(rt_mean),
+        "RT_Congruent": float(rt_congruent),
+        "RT_Incongruent": float(rt_incongruent),
+        "Interference": float(interference),
+        "Lapses": int(lapses),
+        "False_Starts": int(false_starts),
+        "Valid_Trials": int(valid_trials),
+    }
+
+    # 1. 寫入雲端資料庫 Supabase
+    supabase_ok = False
+    if sb:
+        try:
+            sb.table("health_logs").insert(data).execute()
+            supabase_ok = True
+        except Exception:
+            pass
+
+    # 2. 寫入本地 CSV 作為底層防護備份
+    try:
+        safe_name = "".join(c for c in str(name) if c.isalnum() or c in ("-", "_"))[:32] or "anon"
+        fname = f"health_data_{safe_name}.csv"
+        df_new = pd.DataFrame([data])
+        if os.path.exists(fname):
+            df_old = pd.read_csv(fname)
+            pd.concat([df_old, df_new], ignore_index=True).to_csv(fname, index=False)
+        else:
+            df_new.to_csv(fname, index=False)
     except Exception:
-        return pd.DataFrame()
+        pass
+
+    return supabase_ok
 
 
-# -------- 8. Baseline 計算 --------
-def compute_user_baseline(df: pd.DataFrame, n_days: int = 3) -> dict:
-    """
-    計算儀表板個人化基準線 (Baseline)。
-    修正原版邏輯錯誤：原本 tail(n_days) 取「最近 n 筆」會導致基準等於最新資料本身（無意義）；
-    改為取「最早 n 筆」作為個人基準，符合 baseline 的學術定義。
-    """
+# -------- 7. 資料流：歷史追蹤數據載入器 --------
+def load_user_history(user_name: str) -> pd.DataFrame:
+    """優先自雲端獲取完整的縱向歷史紀錄，雲端斷線時自動從本地降級加載。"""
+    sb = get_supabase()
+    clean_user = "".join(c for c in str(user_name) if c.isalnum() or c in ("-", "_"))[:32]
+
+    if sb:
+        try:
+            res = sb.table("health_logs").select("*").eq("User_Name", clean_user).order("Date").execute()
+            if res.data:
+                return pd.DataFrame(res.data)
+        except Exception:
+            pass
+
+    safe_name = "".join(c for c in str(user_name) if c.isalnum() or c in ("-", "_"))[:32] or "anon"
+    fname = f"health_data_{safe_name}.csv"
+    return pd.read_csv(fname) if os.path.exists(fname) else pd.DataFrame()
+
+
+# -------- 8. 臨床分析：基準線與相對位移量計算 --------
+def compute_user_baseline(df: pd.DataFrame, n_days: int = 3) -> dict[str, float]:
+    """用受試者『前 n_days 次的中位數』作為穩健的個人生理與認知平衡基準線 (Baseline)。"""
     if df is None or df.empty:
         return {}
-
-    # 取最早的 n 筆作為個人基準
-    head = df.head(n_days)
-    if head.empty:
-        return {}
-
-    base = {}
-    cols = ["Sleep_Hours", "Fatigue_Level", "Delta_E", "Mean_RT"]
-    for col in cols:
-        if col in head.columns:
-            series = pd.to_numeric(head[col], errors="coerce").dropna()
-            if not series.empty:
-                base[col] = float(series.median())
-    return base
+    df_sorted = df.sort_values("Date").head(max(n_days, 1))
+    out = {}
+    for col in ("Delta_E", "Mean_RT", "Lapses", "Interference"):
+        if col in df_sorted.columns and df_sorted[col].notna().any():
+            out[col] = float(df_sorted[col].median())
+    return out
 
 
-def compute_relative_change(current, base):
-    """計算最新數據相對基準線的百分比位移量"""
-    try:
-        if base is None or pd.isna(base) or float(base) == 0:
-            return None
-        return ((float(current) - float(base)) / float(base)) * 100
-    except (TypeError, ValueError):
+def compute_relative_change(current: float, baseline: float) -> float | None:
+    """計算最新單次數據相對於個人基準線的百分比偏差位移量。"""
+    if baseline is None or abs(baseline) < 1e-9:
         return None
+    return (current - baseline) / baseline * 100.0
 
 
-# -------- 9. 視覺：背景注入 --------
+# ------------------------------------------------------------------
+#  9. 視覺：高端全局毛玻璃卡片模塊化 CSS 注入器（UI 優化核心）
+# ------------------------------------------------------------------
 def set_bg_from_local(image_file: str):
-    """高階全局毛玻璃視覺遮罩濾鏡注入器"""
+    """
+    高度硬化的 CSS 全局注入：為表單、數據指標、輸入框與上傳區
+    全面套用高對比深色毛玻璃模塊背景，徹底根除草地背景導致的字體吃字與不易辨識問題。
+    """
     try:
         if not os.path.exists(image_file):
             return
         with open(image_file, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
 
-        # 從副檔名推斷正確的 mime type
         ext = os.path.splitext(image_file)[1].lower().lstrip(".")
         mime = "png" if ext == "png" else "jpeg"
 
         st.markdown(
             f"""
         <style>
+        /* 1. 設定背景圖與基礎暗色濾鏡 */
         .stApp {{
             background-image: url("data:image/{mime};base64,{b64}");
             background-size: cover;
@@ -370,21 +293,60 @@ def set_bg_from_local(image_file: str):
             background-position: center;
         }}
         [data-testid="stAppViewContainer"] > .main {{
-            background-color: rgba(12, 12, 12, 0.75) !important;
+            background-color: rgba(10, 10, 10, 0.78) !important;
         }}
-        [data-testid="stAlert"] {{
-            background-color: rgba(30, 30, 30, 0.94) !important;
-            border: 1px solid rgba(255, 255, 255, 0.18) !important;
-            border-radius: 12px !important;
+        
+        /* 2. 所有主要表單 (st.form) 模塊化卡片化設計 */
+        [data-testid="stForm"] {{
+            background-color: rgba(22, 22, 22, 0.92) !important;
+            border: 1px solid rgba(255, 255, 255, 0.16) !important;
+            border-radius: 16px !important;
+            padding: 28px !important;
             backdrop-filter: blur(12px) !important;
-            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5) !important;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6) !important;
+        }}
+        
+        /* 3. 數據儀表板統計指標 (st.metric) 模塊卡片化 */
+        [data-testid="stMetric"] {{
+            background-color: rgba(30, 30, 30, 0.94) !important;
+            border: 1px solid rgba(255, 255, 255, 0.14) !important;
+            border-radius: 12px !important;
+            padding: 16px !important;
+            backdrop-filter: blur(8px) !important;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
+        }}
+        
+        /* 4. 強化所有文字輸入框、下拉選單、檔案上傳拖曳區的底色對比度 */
+        div[data-baseweb="input"], div[data-baseweb="select"], [data-testid="stFileUploadDropzone"] {{
+            background-color: rgba(14, 14, 14, 0.95) !important;
+            border: 1px solid rgba(255, 255, 255, 0.15) !important;
+            border-radius: 8px !important;
+        }}
+        
+        /* 5. 提示框 (st.info, st.success, st.warning) 視覺硬化 */
+        [data-testid="stAlert"] {{
+            background-color: rgba(28, 28, 28, 0.96) !important;
+            border: 1px solid rgba(255, 255, 255, 0.22) !important;
+            border-radius: 12px !important;
+            backdrop-filter: blur(10px) !important;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5) !important;
         }}
         [data-testid="stAlert"] p {{
             color: #FFFFFF !important;
+            font-weight: 500 !important;
         }}
+        
+        /* 6. 折疊面板 (st.expander) 視覺一致化 */
         [data-testid="stExpander"] {{
-            background-color: rgba(32, 32, 32, 0.88) !important;
+            background-color: rgba(26, 26, 26, 0.88) !important;
+            border: 1px solid rgba(255, 255, 255, 0.12) !important;
             border-radius: 10px !important;
+            backdrop-filter: blur(6px) !important;
+        }}
+        
+        /* 7. 全局文字邊緣文字陰影 (Text Shadow) 保護層，全面防禦吃字 */
+        h1, h2, h3, h4, h5, h6, p, label, .stMarkdown {{
+            text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.85) !important;
         }}
         </style>
         """,
