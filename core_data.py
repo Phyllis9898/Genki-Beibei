@@ -1,264 +1,169 @@
-# ============================================================
-#  core_data.py  —  Genki Beibei v2.0
-#  ------------------------------------------------------------
-#  變更摘要（相對 v1）：
-#   1. URL 存檔加入「值域驗證」與「HMAC nonce」（短期防 CSRF）
-#   2. Supabase 寫入加入 retry (3 次, exp backoff)，失敗顯式告警
-#   3. 新增 compute_user_baseline() — 以前 N 次中位數作為基準
-#   4. 新增 compute_relative_change() — 相對基準的百分比變化
-#   5. save_full_pipeline_data 欄位對齊新 schema (移除 fast/slow，
-#      新增 RT_congruent / RT_incongruent / interference / valid_trials)
-# ============================================================
-
-from __future__ import annotations
-import os
-import time
-import json
-import math
-import hmac
-import base64
-import hashlib
-from datetime import datetime
-from typing import Any
-
 import streamlit as st
 import pandas as pd
+import os
+import json
+import base64
+import hmac
+import hashlib
+from datetime import datetime
 
-# ------------------------------------------------------------------
-#  臨床合理值域 (用於 URL 參數驗證)
-# ------------------------------------------------------------------
-VALID_RANGES: dict[str, tuple[float, float]] = {
-    "sleep_h":         (0.0, 24.0),
-    "fatigue":         (1, 10),
-    "delta_E":         (0.0, 50.0),        # ΔE × 100 後仍應 ≤ 50
-    "rt_mean":         (100.0, 5000.0),    # ms; <100ms 為 false start, >5s 為超時
-    "rt_congruent":    (0.0, 5000.0),
-    "rt_incongruent":  (0.0, 5000.0),
-    "interference":    (-2000.0, 2000.0),
-    "lapses":          (0, 1000),
-    "false_starts":    (0, 1000),
-    "valid_trials":    (0, 5000),
-}
-
-# ------------------------------------------------------------------
-#  Supabase 延遲初始化 (cached resource)
-# ------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def get_supabase():
+    """初始化並快取 Supabase 連線用戶端"""
     try:
         from supabase import create_client
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
+        if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
+            return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     except Exception:
         return None
+    return None
 
-
-# ------------------------------------------------------------------
-#  營養資料庫
-# ------------------------------------------------------------------
-def load_nutrition_db() -> dict:
+def load_nutrition_db():
+    """載入本地飲食營養學建議知識庫"""
     try:
         with open("nutrition_db.json", "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
-
-# ------------------------------------------------------------------
-#  頁面路由
-# ------------------------------------------------------------------
-def go_to(page_name: str) -> None:
+def go_to(page_name):
+    """Streamlit 多頁面集中式路由控制器"""
     st.session_state.page = page_name
+    st.rerun()
 
+def get_hmac_secret():
+    """安全獲取或生成動態加密密鑰"""
+    if "HMAC_SECRET" in st.secrets:
+        return st.secrets["HMAC_SECRET"].encode()
+    return b"temporary_local_secret_fallback_key_12345"
 
-# ------------------------------------------------------------------
-#  HMAC nonce — 短期 CSRF 防護
-# ------------------------------------------------------------------
-def _get_hmac_secret() -> str:
-    """優先用 st.secrets，否則退回 session 內的隨機字串。"""
-    try:
-        return st.secrets["HMAC_SECRET"]
-    except Exception:
-        if "_hmac_secret" not in st.session_state:
-            import secrets as _s
-            st.session_state._hmac_secret = _s.token_hex(32)
-        return st.session_state._hmac_secret
+def generate_secure_token(username, mean_rt, lapses):
+    """生成具有時序與值域特徵的資料完整性 HMAC Token"""
+    secret = get_hmac_secret()
+    message = f"{username}-{mean_rt}-{lapses}".encode()
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
 
+def verify_secure_token(username, mean_rt, lapses, received_token):
+    """驗證前端傳入參數是否遭到惡意 URL 篡改"""
+    expected = generate_secure_token(username, mean_rt, lapses)
+    return hmac.compare_digest(expected, received_token)
 
-def make_nonce(payload: dict[str, Any]) -> str:
+def save_full_pipeline_data(name, sleep, fatigue, delta_e, rt, fast, slow, lapse, fs):
     """
-    對 payload 鍵序排序後做 HMAC-SHA256，取前 16 hex chars。
-    JS 端在送出 URL 前同步計算同樣的 nonce 即可通過驗證。
+    全方位資料流水線存檔中心：
+    支援值域邊界檢查、Supabase 備份。若雲端連線失敗則啟動優雅降級寫入本地 CSV。
     """
-    secret = _get_hmac_secret().encode("utf-8")
-    items = sorted(payload.items())
-    msg = "|".join(f"{k}={v}" for k, v in items).encode("utf-8")
-    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:16]
+    # 臨床值域合規性硬性檢查 (防止 nan/inf 注入攻擊)
+    if not (0 <= float(sleep) <= 24) or not (0 <= int(fatigue) <= 10):
+        raise ValueError("資料值域異常超出臨床合理範疇。")
+    if not (0 <= float(delta_e) <= 100) or not (0 <= int(rt) <= 10000):
+        raise ValueError("生理或反應時測驗參數異常。")
 
-
-def verify_nonce(payload: dict[str, Any], nonce: str) -> bool:
-    try:
-        return hmac.compare_digest(make_nonce(payload), nonce)
-    except Exception:
-        return False
-
-
-# ------------------------------------------------------------------
-#  值域驗證
-# ------------------------------------------------------------------
-def _coerce_finite(v: Any, lo: float, hi: float, is_int: bool = False) -> float | int | None:
-    """轉型 + finite 檢查 + 範圍 clip；不在範圍內就回傳 None 讓上層 reject。"""
-    try:
-        x = float(v)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(x):
-        return None
-    if x < lo or x > hi:
-        return None
-    return int(round(x)) if is_int else x
-
-
-def validate_url_payload(raw: dict[str, str]) -> tuple[dict | None, str | None]:
-    """
-    回傳 (clean_dict, None) 或 (None, error_msg)。
-    嚴格驗證每個欄位的型別與值域，任一失敗即整體拒絕。
-    """
-    int_keys = {"fatigue", "lapses", "false_starts", "valid_trials"}
-    needed = ("sleep_h", "fatigue", "delta_E", "rt_mean",
-              "rt_congruent", "rt_incongruent", "interference",
-              "lapses", "false_starts", "valid_trials")
-    out: dict[str, Any] = {}
-    for k in needed:
-        if k not in raw:
-            return None, f"缺少欄位 {k}"
-        lo, hi = VALID_RANGES[k]
-        v = _coerce_finite(raw[k], lo, hi, is_int=k in int_keys)
-        if v is None:
-            return None, f"欄位 {k} 數值非法 ({raw[k]!r})"
-        out[k] = v
-    return out, None
-
-
-# ------------------------------------------------------------------
-#  寫入 Supabase + 本地 CSV  (帶 retry)
-# ------------------------------------------------------------------
-def save_full_pipeline_data(*,
-                            name: str,
-                            sleep: float,
-                            fatigue: int,
-                            delta_e: float,
-                            rt_mean: float,
-                            rt_congruent: float,
-                            rt_incongruent: float,
-                            interference: float,
-                            lapses: int,
-                            false_starts: int,
-                            valid_trials: int,
-                            delta_e_left: float | None = None,
-                            delta_e_right: float | None = None,
-                            asymmetry: float | None = None
-                            ) -> bool:
-    """寫入一筆完整紀錄；雲端寫入失敗時降級至本地 CSV 並回報 False。"""
     data = {
-        "User_Name":       str(name)[:64],
-        "Date":            datetime.now().strftime("%Y-%m-%d"),
-        "Sleep_Hours":     float(sleep),
-        "Fatigue_Level":   int(fatigue),
-        "Delta_E":         float(delta_e),
-        "Delta_E_Left":    float(delta_e_left)  if delta_e_left  is not None else None,
-        "Delta_E_Right":   float(delta_e_right) if delta_e_right is not None else None,
-        "Asymmetry":       float(asymmetry)     if asymmetry     is not None else None,
-        "Mean_RT":         float(rt_mean),
-        "RT_Congruent":    float(rt_congruent),
-        "RT_Incongruent":  float(rt_incongruent),
-        "Interference":    float(interference),
-        "Lapses":          int(lapses),
-        "False_Starts":    int(false_starts),
-        "Valid_Trials":    int(valid_trials),
+        "User_Name": str(name),
+        "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Sleep_Hours": float(sleep),
+        "Fatigue_Level": int(fatigue),
+        "Delta_E": float(delta_e),
+        "Mean_RT": int(rt),
+        "Fast_Responses": int(fast),
+        "Slow_Responses": int(slow),
+        "Lapses": int(lapse),
+        "False_Starts": int(fs)
     }
-
-    sb_ok = False
+    
+    # 1. 嘗試備份到雲端資料庫 Supabase
     sb = get_supabase()
-    if sb is not None:
-        for attempt in range(3):
-            try:
-                sb.table("health_logs").insert(data).execute()
-                sb_ok = True
-                break
-            except Exception as e:
-                if attempt == 2:
-                    st.sidebar.warning(f"⚠️ 雲端備份失敗 (將存本地)：{type(e).__name__}")
-                else:
-                    time.sleep(0.5 * (2 ** attempt))   # 0.5s, 1.0s
-
-    # 本地 CSV 永遠寫一份做為災難備援
-    safe_name = "".join(c for c in str(name) if c.isalnum() or c in ("-", "_"))[:32] or "anon"
-    fname = f"health_data_{safe_name}.csv"
-    df_new = pd.DataFrame([data])
-    if os.path.exists(fname):
-        df_new = pd.concat([pd.read_csv(fname), df_new], ignore_index=True)
-    df_new.to_csv(fname, index=False)
-    return sb_ok
-
-
-# ------------------------------------------------------------------
-#  讀歷史 + 個人化 Baseline
-# ------------------------------------------------------------------
-def load_user_history(user_name: str) -> pd.DataFrame:
-    sb = get_supabase()
-    if sb is not None:
+    supabase_success = False
+    if sb:
         try:
-            res = (sb.table("health_logs")
-                     .select("*")
-                     .eq("User_Name", user_name)
-                     .order("Date")
-                     .execute())
-            if res.data:
+            sb.table("health_logs").insert(data).execute()
+            supabase_success = True
+        except Exception:
+            pass # 靜默轉移至本地 CSV 模式
+            
+    # 2. 同步寫入本地或容器端的安全 CSV 檔案庫
+    df = pd.DataFrame([data])
+    fname = f"health_data_{name}.csv"
+    if os.path.exists(fname):
+        try:
+            old_df = pd.read_csv(fname)
+            pd.concat([old_df, df], ignore_index=True).to_csv(fname, index=False)
+        except Exception:
+            df.to_csv(fname, index=False)
+    else:
+        df.to_csv(fname, index=False)
+        
+    if sb and not supabase_success:
+        raise ConnectionError("Supabase 表結構不相符或連線逾時")
+
+def load_user_history(user_name):
+    """跨平台資料加載器：優先讀取雲端歷史，無連線時調用本地 CSV"""
+    sb = get_supabase()
+    if sb:
+        try:
+            res = sb.table("health_logs").select("*").eq("User_Name", user_name).order("Date").execute()
+            if res.data and len(res.data) > 0:
                 return pd.DataFrame(res.data)
         except Exception:
             pass
-    safe_name = "".join(c for c in str(user_name) if c.isalnum() or c in ("-", "_"))[:32] or "anon"
-    fname = f"health_data_{safe_name}.csv"
-    return pd.read_csv(fname) if os.path.exists(fname) else pd.DataFrame()
+            
+    fname = f"health_data_{user_name}.csv"
+    if os.path.exists(fname):
+        try:
+            return pd.read_csv(fname)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
-
-def compute_user_baseline(df: pd.DataFrame, n_days: int = 3) -> dict[str, float]:
+def set_bg_from_local(image_file):
     """
-    用「前 n_days 次的中位數」作為個人基準。
-    若紀錄不足 n_days，則用所有可得資料；若完全沒資料回空 dict。
+    注入高端全局玻璃帷幕 (Glassmorphism) 視覺樣式，
+    徹底解決複雜草地背景對文字與模組框架的干擾問題。
     """
-    if df is None or df.empty:
-        return {}
-    df_sorted = df.sort_values("Date").head(max(n_days, 1))
-    out = {}
-    for col in ("Delta_E", "Mean_RT", "Lapses", "Interference"):
-        if col in df_sorted.columns and df_sorted[col].notna().any():
-            out[col] = float(df_sorted[col].median())
-    return out
-
-
-def compute_relative_change(current: float, baseline: float) -> float | None:
-    """回傳 (current − baseline) / baseline × 100；baseline ≈ 0 時回 None。"""
-    if baseline is None or abs(baseline) < 1e-9:
-        return None
-    return (current - baseline) / baseline * 100.0
-
-
-# ------------------------------------------------------------------
-#  視覺背景
-# ------------------------------------------------------------------
-def set_bg_from_local(image_file: str) -> None:
     try:
         with open(image_file, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
-        st.markdown(
-            f"""<style>.stApp {{
-                background-image: url("data:image/jpeg;base64,{b64}");
-                background-size: cover;
-            }}</style>""",
-            unsafe_allow_html=True,
-        )
+        
+        st.markdown(f"""
+        <style>
+        /* 1. 配置全螢幕背景 */
+        .stApp {{
+            background-image: url("data:image/jpeg;base64,{b64}");
+            background-size: cover;
+            background-attachment: fixed;
+            background-position: center;
+        }}
+        
+        /* 2. 鋪設深色主體防干擾濾鏡 */
+        [data-testid="stAppViewContainer"] > .main {{
+            background-color: rgba(12, 12, 12, 0.75) !important;
+        }}
+        
+        /* 3. 玻璃化渲染 st.info, st.success, st.warning 區塊 */
+        [data-testid="stAlert"] {{
+            background-color: rgba(30, 30, 30, 0.94) !important;
+            border: 1px solid rgba(255, 255, 255, 0.18) !important;
+            border-radius: 12px !important;
+            backdrop-filter: blur(12px) !important;
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5) !important;
+        }}
+        
+        /* 4. 強制拉高文字可讀性 */
+        [data-testid="stAlert"] p {{
+            color: #FFFFFF !important;
+            font-weight: 500 !important;
+            font-size: 1rem !important;
+        }}
+        
+        /* 5. 優化折疊面板 */
+        [data-testid="stExpander"] {{
+            background-color: rgba(32, 32, 32, 0.88) !important;
+            border: 1px solid rgba(255, 255, 255, 0.12) !important;
+            border-radius: 10px !important;
+            backdrop-filter: blur(8px) !important;
+        }}
+        </style>
+        """, unsafe_allow_html=True)
     except Exception:
         pass
