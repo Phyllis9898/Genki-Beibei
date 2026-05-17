@@ -1,21 +1,23 @@
 # ============================================================
-#  main.py  —  Genki Beibei v2.2 (Stroop Edition)
+#  main.py  —  Genki Beibei v2.3 (Hardened Routing Edition)
 # ============================================================
 import streamlit as st
 
-st.set_page_config(page_title="元氣貝貝 Genki Beibei",
-                   layout="wide",
-                   page_icon="🌱")
+st.set_page_config(
+    page_title="元氣貝貝 Genki Beibei",
+    layout="wide",
+    page_icon="🌱",
+)
 
 import urllib.parse  # noqa: E402
 
-from core_data import (   # noqa: E402
+from core_data import (  # noqa: E402
     set_bg_from_local,
     save_full_pipeline_data,
     validate_url_payload,
     verify_nonce,
 )
-from ui_pages import (    # noqa: E402
+from ui_pages import (  # noqa: E402
     show_landing,
     show_profile,
     show_home,
@@ -29,11 +31,12 @@ set_bg_from_local("bg.png")
 
 _defaults = {
     "page": "landing",
-    "user_name": "",          
+    "user_name": "",
     "user_age": 22,
     "user_job": "學生",
     "temp_analysis_data": None,
-    "test_mode": "stroop",  # 預設改為更活潑的 Stroop 測驗
+    "test_mode": "stroop",
+    "logged_in": False,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -43,15 +46,25 @@ for k, v in _defaults.items():
 # ==========================================================
 #  URL 攔截器 — 存檔 API
 # ==========================================================
-try:
-    qp = st.query_params
-    has_save = "save" in qp
-except AttributeError:
-    qp = st.experimental_get_query_params()
-    has_save = "save" in qp
+def _get_query_params():
+    """跨版本相容地取得 query params。"""
+    try:
+        qp = st.query_params
+        return qp, ("save" in qp)
+    except AttributeError:
+        qp = st.experimental_get_query_params()
+        return qp, ("save" in qp)
 
 
-def _qp_val(k: str) -> str | None:
+def _clear_query_params():
+    """跨版本相容地清空 query params。"""
+    try:
+        st.query_params.clear()
+    except AttributeError:
+        st.experimental_set_query_params()
+
+
+def _qp_val(qp, k: str):
     v = qp.get(k)
     if v is None:
         return None
@@ -60,36 +73,55 @@ def _qp_val(k: str) -> str | None:
     return v
 
 
+qp, has_save = _get_query_params()
+
 if has_save:
-    raw_user = _qp_val("u") or ""
-    user = urllib.parse.unquote(raw_user)[:64]
+    raw_user = _qp_val(qp, "u") or ""
+    user = urllib.parse.unquote(raw_user)[:64].strip()
 
     raw_payload = {
-        "sleep_h":        _qp_val("sl"),
-        "fatigue":        _qp_val("fa"),
-        "delta_E":        _qp_val("de"),
-        "rt_mean":        _qp_val("rt"),
-        "rt_congruent":   _qp_val("rc"),
-        "rt_incongruent": _qp_val("ri"),
-        "interference":   _qp_val("it"),
-        "lapses":         _qp_val("la"),
-        "false_starts":   _qp_val("fs"),
-        "valid_trials":   _qp_val("vt"),
+        "sleep_h":        _qp_val(qp, "sl"),
+        "fatigue":        _qp_val(qp, "fa"),
+        "delta_E":        _qp_val(qp, "de"),
+        "rt_mean":        _qp_val(qp, "rt"),
+        "rt_congruent":   _qp_val(qp, "rc"),
+        "rt_incongruent": _qp_val(qp, "ri"),
+        "interference":   _qp_val(qp, "it"),
+        "lapses":         _qp_val(qp, "la"),
+        "false_starts":   _qp_val(qp, "fs"),
+        "valid_trials":   _qp_val(qp, "vt"),
     }
-    nonce = _qp_val("nc") or ""
+    nonce = _qp_val(qp, "nc") or ""
 
     clean, err = validate_url_payload(raw_payload)
+
     if err is not None or not user:
         st.sidebar.error(f"🚫 存檔被拒絕：{err or '使用者名稱缺失'}")
+        _clear_query_params()
     else:
+        # nonce 簽章必須涵蓋「全部」測驗欄位，避免 RT/lapses 等被攔截竄改
         verify_dict = {
-            "u":       user,
-            "sleep_h": clean["sleep_h"],
-            "fatigue": clean["fatigue"],
-            "delta_E": clean["delta_E"],
+            "u":              user,
+            "sleep_h":        clean["sleep_h"],
+            "fatigue":        clean["fatigue"],
+            "delta_E":        clean["delta_E"],
+            "rt_mean":        clean["rt_mean"],
+            "rt_congruent":   clean["rt_congruent"],
+            "rt_incongruent": clean["rt_incongruent"],
+            "interference":   clean["interference"],
+            "lapses":         clean["lapses"],
+            "false_starts":   clean["false_starts"],
+            "valid_trials":   clean["valid_trials"],
         }
-        if not verify_nonce(verify_dict, nonce):
+
+        # 攻擊面收斂：必須先登入過且 URL 中使用者名與 session 一致才能存檔
+        session_user = (st.session_state.get("user_name") or "").strip()
+        if not session_user or session_user != user:
+            st.sidebar.error("🚫 存檔被拒絕：登入狀態與 URL 使用者不一致。")
+            _clear_query_params()
+        elif not verify_nonce(verify_dict, nonce):
             st.sidebar.error("🚫 存檔被拒絕：完整性檢查 (HMAC) 失敗。")
+            _clear_query_params()
         else:
             extra = st.session_state.get("temp_analysis_data") or {}
             ok = save_full_pipeline_data(
@@ -109,30 +141,36 @@ if has_save:
                 asymmetry=extra.get("asymmetry"),
             )
             if ok:
-                st.sidebar.success("✅ 已成功寫入雲端。")
+                st.sidebar.success("✅ 已成功同步至 Supabase 雲端。")
+            else:
+                st.sidebar.error("❌ 雲端資料同步失敗，請檢查資料表架構。")
 
             st.session_state.user_name = user
             st.session_state.temp_analysis_data = None
             st.session_state.page = "dashboard"
-
-    try:
-        st.query_params.clear()
-    except AttributeError:
-        st.experimental_set_query_params()
-    st.rerun()
+            _clear_query_params()
+            st.rerun()
 
 
 # ==========================================================
-#  路由控制器
+#  路由控制器（含登入態守門）
 # ==========================================================
 ROUTES = {
-    "landing":  show_landing,
-    "profile":  show_profile,
-    "home":     show_home,
-    "analyzer": show_analyzer,
-    "pvt_game": show_pvt_game,
+    "landing":   show_landing,
+    "profile":   show_profile,
+    "home":      show_home,
+    "analyzer":  show_analyzer,
+    "pvt_game":  show_pvt_game,
     "dashboard": show_dashboard,
 }
 
-view = ROUTES.get(st.session_state.page, show_landing)
+# 未登入時禁止直接進入需要驗身的內頁
+PROTECTED_PAGES = {"home", "analyzer", "pvt_game", "dashboard"}
+
+current_page = st.session_state.page
+if current_page in PROTECTED_PAGES and not (st.session_state.get("user_name") or "").strip():
+    st.session_state.page = "profile"
+    current_page = "profile"
+
+view = ROUTES.get(current_page, show_landing)
 view()
