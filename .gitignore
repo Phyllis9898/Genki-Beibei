@@ -1,8 +1,25 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
 venv/
+env/
 .env
 .streamlit/secrets.toml
 health_data_*.csv
 .DS_Store
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# 本地測試輸出
+*.log
+.coverage
+.pytest_cache/
+.mypy_cache/
+
+# OS
+Thumbs.db
