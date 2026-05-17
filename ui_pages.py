@@ -56,10 +56,10 @@ def show_cv_page():
                     st.image(res["annotated_img"], caption="雙眼(紅/藍框)與面頰(綠框)自動採樣 ROI", use_container_width=True)
                 
                 metrics = res["metrics"]
-                st.session_state.delta_e = metrics["delta_e"]
+                st.session_state.delta_e = metrics["delta_E"]
                 
                 st.write("### 📊 色彩分析報告數據")
-                st.metric("核心定量色差值 (Delta E)", f"{metrics['delta_e']} 門檻")
+                st.metric("核心定量色差值 (Delta E)", f"{metrics['delta_E']} 門檻")
                 st.write(f"個體膚色分類 ITA 角度: `{metrics['ita']}°`")
                 
                 if res["has_dark_circles"]:
