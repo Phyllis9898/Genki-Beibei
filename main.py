@@ -15,7 +15,7 @@ st.set_page_config(
 if "page" not in st.session_state:
     st.session_state.page = "home"
 if "user_name" not in st.session_state:
-    st.session_state.user_name = "龔同學"
+    st.session_state.user_name = ""
 if "sleep_hours" not in st.session_state:
     st.session_state.sleep_hours = 7.0
 if "fatigue_level" not in st.session_state:
