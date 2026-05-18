@@ -114,12 +114,12 @@ if has_save:
             "valid_trials":   clean["valid_trials"],
         }
 
-        # 攻擊面收斂：必須先登入過且 URL 中使用者名與 session 一致才能存檔
-        session_user = (st.session_state.get("user_name") or "").strip()
-        if not session_user or session_user != user:
-            st.sidebar.error("🚫 存檔被拒絕：登入狀態與 URL 使用者不一致。")
-            _clear_query_params()
-        elif not verify_nonce(verify_dict, nonce):
+        # 安全模型說明:
+        #   防偽造攻擊的核心是 HMAC nonce — 因為 nonce 已涵蓋 u 欄位且簽章
+        #   密鑰 HMAC_SECRET 不外洩, 攻擊者無法偽造任一使用者的存檔 URL。
+        #   原本檢查「session_user == url_user」會在 iframe target=_top 跳轉
+        #   後 kernel 重啟、session 流失時誤觸發, 因此改為「HMAC 通過即信任」。
+        if not verify_nonce(verify_dict, nonce):
             st.sidebar.error("🚫 存檔被拒絕：完整性檢查 (HMAC) 失敗。")
             _clear_query_params()
         else:
