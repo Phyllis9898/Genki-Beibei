@@ -161,10 +161,22 @@ def login_user(username: str, password: str):
 
 
 # -------- 5. 安全：HMAC nonce（URL 完整性簽章）--------
+# 設計理由 (iframe 約束下的最佳安全平衡):
+#   由於 Streamlit Cloud 不允許將 HMAC_SECRET 下放至 JS 端 (會洩漏),
+#   而 JS 端的 RT 等欄位必須等到測驗結束才有值, 所以我們無法在「同一次
+#   簽章」涵蓋所有 11 個欄位。
+#
+#   採用「兩段式信任模型」:
+#     A. 預簽欄位 (NONCE_FIELDS): u, sleep_h, fatigue, delta_E
+#        — 由 Python 在進入測驗前簽章, 保證身份與主觀資料不可竄改
+#     B. 測驗結果欄位: rt_*, lapses, false_starts, valid_trials, interference
+#        — 由 JS 端產生, Python 端用 _PAYLOAD_SCHEMA 做嚴格範圍驗證
+#
+#   威脅分析: 攻擊者最多能在自己的 URL 上修改自己的測驗成績, 但
+#   (a) 只會污染自己的 dashboard (b) 改假反而失去自我追蹤意義
+#   故此妥協對於健康追蹤類學術應用是合理的。
 NONCE_FIELDS = (
     "u", "sleep_h", "fatigue", "delta_E",
-    "rt_mean", "rt_congruent", "rt_incongruent",
-    "interference", "lapses", "false_starts", "valid_trials",
 )
 
 

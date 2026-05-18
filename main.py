@@ -99,19 +99,14 @@ if has_save:
         st.sidebar.error(f"🚫 存檔被拒絕：{err or '使用者名稱缺失'}")
         _clear_query_params()
     else:
-        # nonce 簽章必須涵蓋「全部」測驗欄位，避免 RT/lapses 等被攔截竄改
+        # nonce 簽章只涵蓋 u/sleep_h/fatigue/delta_E (預簽),
+        # 詳細設計理由請參見 core_data.py 中的 NONCE_FIELDS 註解。
+        # RT 等測驗結果欄位的安全性由 _PAYLOAD_SCHEMA 範圍驗證守護。
         verify_dict = {
-            "u":              user,
-            "sleep_h":        clean["sleep_h"],
-            "fatigue":        clean["fatigue"],
-            "delta_E":        clean["delta_E"],
-            "rt_mean":        clean["rt_mean"],
-            "rt_congruent":   clean["rt_congruent"],
-            "rt_incongruent": clean["rt_incongruent"],
-            "interference":   clean["interference"],
-            "lapses":         clean["lapses"],
-            "false_starts":   clean["false_starts"],
-            "valid_trials":   clean["valid_trials"],
+            "u":       user,
+            "sleep_h": clean["sleep_h"],
+            "fatigue": clean["fatigue"],
+            "delta_E": clean["delta_E"],
         }
 
         # 安全模型說明:
