@@ -185,17 +185,20 @@ def verify_nonce(verify_dict: dict, nonce: str) -> bool:
 
 
 # -------- 6. URL Payload 驗證 --------
+# 各欄位允許範圍 (型別, min, max)。
+# delta_E 採 CIEDE2000 標準尺度: 一般 0-100, 極端理論上限約 ~150。
+# delta_L/a/b 採 CIE LAB 通道差: L 差約 -100~100, a/b 差約 -255~255
 _PAYLOAD_SCHEMA = {
     "sleep_h":        ("float", 0.0,    24.0),
     "fatigue":        ("int",   1,      10),
-    "delta_E":        ("float", 0.0,    100.0),
-    "rt_mean":        ("int",   0,      5000),
-    "rt_congruent":   ("int",   0,      5000),
-    "rt_incongruent": ("int",   0,      5000),
-    "interference":   ("int",  -2000,   2000),
-    "lapses":         ("int",   0,      1000),
-    "false_starts":   ("int",   0,      1000),
-    "valid_trials":   ("int",   0,      5000),
+    "delta_E":        ("float", 0.0,    150.0),
+    "rt_mean":        ("int",   0,      10000),
+    "rt_congruent":   ("int",   0,      10000),
+    "rt_incongruent": ("int",   0,      10000),
+    "interference":   ("int",  -5000,   5000),
+    "lapses":         ("int",   0,      2000),
+    "false_starts":   ("int",   0,      2000),
+    "valid_trials":   ("int",   0,      10000),
 }
 
 

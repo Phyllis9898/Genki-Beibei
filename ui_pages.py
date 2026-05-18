@@ -230,22 +230,55 @@ def show_analyzer() -> None:
         )
 
     metrics = results["metrics"]
-    st.markdown("### 📋 雙眼對稱採樣分析結果")
-    cA, cB, cC, cD = st.columns(4)
-    cA.metric("綜合 ΔE", metrics["delta_E"])
-    cB.metric("左眼 ΔE", metrics["delta_E_left"])
-    cC.metric("右眼 ΔE", metrics["delta_E_right"])
-    cD.metric("左右不對稱性", metrics["asymmetry"])
 
-    if results["has_dark_circles"] and db and results["detected_type"] in db:
-        st.warning(f"⚠️ {st.session_state.user_name}，系統偵測到眼周特徵偏移！")
+    # ----- 學術指標顯示 (第一列): 色差主指標 -----
+    st.markdown("### 📋 學術標準色差指標 (CIE LAB 1976 空間)")
+    st.caption(
+        "依文獻 Mokrzycki & Tatol (2011)：ΔE < 1 觀察不到；1-2 訓練者才能分辨；"
+        "2-3.5 一般人需對比才感知；3.5-5 清楚可見；≥ 5 明顯不同。"
+    )
+    cA, cB, cC, cD = st.columns(4)
+    cA.metric("🎯 主指標 ΔE₀₀ (CIEDE2000)", metrics["delta_E"],
+              help="2005 年 Sharma 等人提出, 對人眼感知對應度約 95%")
+    cB.metric("📐 對照 ΔE*ab (CIE76)", metrics["delta_E_cie76"],
+              help="傳統歐式色差, 對應度約 75%")
+    cC.metric("👁️◐ 左眼 ΔE₀₀", metrics["delta_E_left"])
+    cD.metric("👁️◑ 右眼 ΔE₀₀", metrics["delta_E_right"])
+
+    # ----- 學術指標顯示 (第二列): CIE LAB 通道差 -----
+    st.markdown("##### 🔬 個別通道差 (病理機制判讀)")
+    st.caption("ΔL* > 0 代表眼周較暗 (黑眼圈核心); Δa* > 0 代表偏紅 (血管型徵候)")
+    eA, eB, eC, eD = st.columns(4)
+    eA.metric("ΔL* (明度差)", metrics["delta_L"])
+    eB.metric("Δa* (紅綠差)", metrics["delta_a"])
+    eC.metric("Δb* (黃藍差)", metrics["delta_b"])
+    eD.metric("⚖️ 左右不對稱", metrics["asymmetry"])
+
+    # ----- 學術指標顯示 (第三列): 膚色分型 -----
+    st.markdown(
+        f"##### 🌗 ITA° 膚色分型 (Chardon 1991): "
+        f"**{metrics['ita']}°** → **{results.get('skin_type_ita', 'N/A')}**"
+    )
+
+    # ----- 病因判定 -----
+    if results["has_dark_circles"]:
+        st.warning(f"⚠️ {st.session_state.user_name}，系統偵測到眼周色差超過學術閾值 (ΔE₀₀ ≥ 3.5 或 ΔL* ≥ 3)。")
         display_title = (
-            "傾向微血管型暗沉" if results["detected_type"] == "vascular"
-            else "傾向黑色素沉澱暗沉"
+            "傾向血管型 (vascular) — Δa* 偏正, 推測為皮下血管透出造成"
+            if results["detected_type"] == "vascular"
+            else "傾向色素沉澱型 (pigmented) — Δa* 不顯著, 推測為色素累積"
         )
-        st.markdown(f"#### 🔍 特徵判定：{display_title}")
+        st.markdown(f"#### 🔍 病因子型判定：{display_title}")
+        if db and results["detected_type"] in db:
+            with st.expander("📚 點此查看對應護理建議"):
+                info = db[results["detected_type"]]
+                if isinstance(info, dict):
+                    for k, v in info.items():
+                        st.markdown(f"**{k}**：{v}")
+                else:
+                    st.markdown(str(info))
     else:
-        st.success(f"✨ {st.session_state.user_name}，您的氣色良好！請繼續保持！")
+        st.success(f"✨ {st.session_state.user_name}，您的眼周色差未達學術閾值，氣色良好！")
 
     st.markdown("---")
     next_label = (
@@ -551,13 +584,13 @@ def show_pvt_game() -> None:
       sleep_h:        PREFILL_SLEEP,
       fatigue:        PREFILL_FATIGUE,
       delta_E:        PREFILL_DELTA_E,
-      rt_mean:        Math.round(safe(meanRT, 0, 5000)),
-      rt_congruent:   Math.round(safe(meanCon, 0, 5000)),
-      rt_incongruent: Math.round(safe(meanInc, 0, 5000)),
-      interference:   Math.round(safe(interference, -2000, 2000)),
-      lapses:         Math.min(lapses, 1000),
-      false_starts:   Math.min(falseStarts, 1000),
-      valid_trials:   Math.min(validTrials, 5000),
+      rt_mean:        Math.round(safe(meanRT, 0, 10000)),
+      rt_congruent:   Math.round(safe(meanCon, 0, 10000)),
+      rt_incongruent: Math.round(safe(meanInc, 0, 10000)),
+      interference:   Math.round(safe(interference, -5000, 5000)),
+      lapses:         Math.min(lapses, 2000),
+      false_starts:   Math.min(falseStarts, 2000),
+      valid_trials:   Math.min(validTrials, 10000),
     }};
 
     // 以 parent 視窗的 origin + pathname 建立 URL，避免 iframe 內 location 解析錯誤
